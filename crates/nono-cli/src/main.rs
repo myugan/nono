@@ -30,7 +30,9 @@ mod update_check;
 
 use capability_ext::CapabilitySetExt;
 use clap::Parser;
-use cli::{Cli, Commands, LearnArgs, RunArgs, SandboxArgs, SetupArgs, ShellArgs, WhyArgs, WhyOp};
+use cli::{
+    Cli, Commands, LearnArgs, RunArgs, SandboxArgs, SetupArgs, ShellArgs, WhyArgs, WhyOp, WrapArgs,
+};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 use profile::WorkdirAccess;
@@ -75,6 +77,11 @@ fn run() -> Result<()> {
             output::print_banner(cli.silent);
             show_update_notification(&mut update_handle, cli.silent);
             run_shell(*args, cli.silent)
+        }
+        Commands::Wrap(args) => {
+            output::print_banner(cli.silent);
+            show_update_notification(&mut update_handle, cli.silent);
+            run_wrap(*args, cli.silent)
         }
         Commands::Why(args) => {
             show_update_notification(&mut update_handle, cli.silent);
@@ -398,10 +405,9 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     let args = run_args.sandbox;
     let command = run_args.command;
     let no_diagnostics = run_args.no_diagnostics;
-    let direct_exec = run_args.direct_exec;
     let rollback = run_args.rollback;
-    let supervised = run_args.supervised;
     let no_rollback_prompt = run_args.no_rollback_prompt;
+    let no_audit = run_args.no_audit;
     let trust_override = run_args.trust_override;
 
     // Check if we have a command to run
@@ -504,9 +510,7 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     // On Linux, seccomp-notify intercepts syscalls at the kernel level -- this flag is
     // informational only (seccomp is installed separately in the child process).
     #[cfg(target_os = "linux")]
-    if supervised {
-        prepared.caps.set_extensions_enabled(true);
-    }
+    prepared.caps.set_extensions_enabled(true);
 
     let trust_scan_verified = scan_result.as_ref().is_some_and(|r| r.verified > 0);
 
@@ -569,14 +573,13 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
         prepared.caps,
         prepared.secrets,
         ExecutionFlags {
-            interactive: prepared.interactive,
+            strategy: exec_strategy::ExecStrategy::Supervised,
             no_diagnostics,
-            direct_exec,
             rollback,
             no_rollback: run_args.no_rollback,
-            supervised,
             no_rollback_prompt,
             trust_override,
+            no_audit,
             silent,
             rollback_all: run_args.rollback_all,
             rollback_include: run_args.rollback_include,
@@ -632,50 +635,82 @@ fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         eprintln!();
     }
 
-    // Shell is always interactive - needs TTY preservation
     execute_sandboxed(
         shell_path.into_os_string(),
         vec![],
         prepared.caps,
         prepared.secrets,
         ExecutionFlags {
-            interactive: true,
             no_diagnostics: true,
-            direct_exec: false,
-            rollback: false,
-            no_rollback: false,
-            supervised: false,
-            no_rollback_prompt: false,
-            trust_override: false,
-            silent,
-            rollback_all: false,
-            rollback_include: Vec::new(),
-            scan_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            trust_scan_verified: false,
-            protected_paths: Vec::new(),
-            rollback_exclude_patterns: Vec::new(),
-            rollback_exclude_globs: Vec::new(),
-            proxy_active: false,
-            network_profile: None,
-            proxy_allow_hosts: Vec::new(),
-            proxy_credentials: Vec::new(),
-            custom_credentials: std::collections::HashMap::new(),
-            external_proxy: None,
-            allow_bind_ports: Vec::new(),
-            proxy_port: None,
+            ..ExecutionFlags::defaults(silent)?
+        },
+    )
+}
+
+/// Apply sandbox and exec into command (nono disappears).
+/// For scripts, piping, and embedding where no parent process is wanted.
+fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
+    let args = wrap_args.sandbox;
+    let command = wrap_args.command;
+    let no_diagnostics = wrap_args.no_diagnostics;
+
+    // Validate: proxy flags are incompatible with Direct mode (no parent to run proxy)
+    if args.network_profile.is_some()
+        || !args.proxy_allow.is_empty()
+        || !args.proxy_credential.is_empty()
+        || args.external_proxy.is_some()
+    {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support proxy flags (--network-profile, --proxy-allow, \
+             --proxy-credential, --external-proxy). Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+
+    if command.is_empty() {
+        return Err(NonoError::NoCommand);
+    }
+
+    let mut command_iter = command.into_iter();
+    let program = OsString::from(command_iter.next().ok_or(NonoError::NoCommand)?);
+    let cmd_args: Vec<OsString> = command_iter.map(OsString::from).collect();
+
+    if args.dry_run {
+        let prepared = prepare_sandbox(&args, silent)?;
+        if !prepared.secrets.is_empty() && !silent {
+            eprintln!(
+                "  Would inject {} credential(s) as environment variables",
+                prepared.secrets.len()
+            );
+        }
+        output::print_dry_run(&program, &cmd_args, silent);
+        return Ok(());
+    }
+
+    let prepared = prepare_sandbox(&args, silent)?;
+
+    execute_sandboxed(
+        program,
+        cmd_args,
+        prepared.caps,
+        prepared.secrets,
+        ExecutionFlags {
+            strategy: exec_strategy::ExecStrategy::Direct,
+            no_diagnostics,
+            ..ExecutionFlags::defaults(silent)?
         },
     )
 }
 
 /// Flags controlling sandboxed execution behavior.
 struct ExecutionFlags {
-    interactive: bool,
+    strategy: exec_strategy::ExecStrategy,
     no_diagnostics: bool,
-    direct_exec: bool,
     rollback: bool,
     no_rollback: bool,
-    supervised: bool,
     no_rollback_prompt: bool,
+    /// Disable audit trail recording for this session
+    no_audit: bool,
     trust_override: bool,
     silent: bool,
     /// Override all auto-exclusions (full snapshot)
@@ -708,6 +743,40 @@ struct ExecutionFlags {
     allow_bind_ports: Vec<u16>,
     /// Fixed port for the credential proxy (from --proxy-port)
     proxy_port: Option<u16>,
+}
+
+impl ExecutionFlags {
+    /// Create flags with sensible defaults.
+    /// Fields that vary per call site (strategy, silent, no_diagnostics, etc.)
+    /// are overridden via struct update syntax.
+    fn defaults(silent: bool) -> Result<Self> {
+        Ok(Self {
+            strategy: exec_strategy::ExecStrategy::Supervised,
+            no_diagnostics: false,
+            rollback: false,
+            no_rollback: false,
+            no_rollback_prompt: false,
+            no_audit: false,
+            trust_override: false,
+            silent,
+            rollback_all: false,
+            rollback_include: Vec::new(),
+            scan_root: std::env::current_dir()
+                .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?,
+            trust_scan_verified: false,
+            protected_paths: Vec::new(),
+            rollback_exclude_patterns: Vec::new(),
+            rollback_exclude_globs: Vec::new(),
+            proxy_active: false,
+            network_profile: None,
+            proxy_allow_hosts: Vec::new(),
+            proxy_credentials: Vec::new(),
+            custom_credentials: std::collections::HashMap::new(),
+            external_proxy: None,
+            allow_bind_ports: Vec::new(),
+            proxy_port: None,
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -745,30 +814,13 @@ fn resolve_effective_proxy_settings(
     }
 }
 
-/// Select execution strategy from user/runtime flags.
-///
-/// Threat-model boundary:
-/// - `Supervised` is selected when `--rollback` (snapshots) or `--supervised`
-///   (approval sidecar) is active. Both require an unsandboxed parent.
-/// - `Direct` is used for interactive/direct-exec paths.
-/// - `Monitor` is the default safer parent-sandboxed mode.
-fn select_execution_strategy(flags: &ExecutionFlags) -> exec_strategy::ExecStrategy {
-    if flags.rollback || flags.supervised || flags.proxy_active {
-        exec_strategy::ExecStrategy::Supervised
-    } else if flags.interactive || flags.direct_exec {
-        exec_strategy::ExecStrategy::Direct
-    } else {
-        exec_strategy::ExecStrategy::Monitor
-    }
-}
-
-/// Apply sandbox pre-fork for strategies that require both parent+child confinement.
+/// Apply sandbox pre-fork for Direct mode (both parent+child confined).
 fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
     caps: &CapabilitySet,
     silent: bool,
 ) -> Result<()> {
-    if !matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
+    if matches!(strategy, exec_strategy::ExecStrategy::Direct) {
         output::print_applying_sandbox(silent);
         Sandbox::apply(caps)?;
         output::print_sandbox_active(silent);
@@ -892,16 +944,10 @@ fn execute_sandboxed(
         }
     }
 
-    // Determine execution strategy.
-    let strategy = select_execution_strategy(&flags);
+    let strategy = flags.strategy;
 
     if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
-        output::print_supervised_info(
-            flags.silent,
-            flags.rollback,
-            flags.supervised,
-            flags.proxy_active,
-        );
+        output::print_supervised_info(flags.silent, flags.rollback, flags.proxy_active);
     }
 
     // Start network proxy if proxy mode is active.
@@ -964,7 +1010,7 @@ fn execute_sandboxed(
         None
     };
 
-    // Apply sandbox BEFORE fork for Direct and Monitor modes.
+    // Apply sandbox BEFORE fork for Direct mode.
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
     // Build environment variables for the command
@@ -1021,17 +1067,43 @@ fn execute_sandboxed(
             exec_strategy::execute_direct(&config)?;
             unreachable!("execute_direct only returns on error");
         }
-        exec_strategy::ExecStrategy::Monitor => {
-            let exit_code = exec_strategy::execute_monitor(&config)?;
-            cleanup_capability_state_file(&cap_file_path);
-            // Explicitly drop borrows then secrets so Zeroizing destructors
-            // run before std::process::exit() which skips destructors.
-            drop(config);
-            drop(loaded_secrets);
-            std::process::exit(exit_code);
-        }
         exec_strategy::ExecStrategy::Supervised => {
             output::print_applying_sandbox(flags.silent);
+
+            // --- Audit session setup (always, unless --no-audit) ---
+            // The session directory and ID are shared between audit and rollback.
+            // Audit writes session.json; rollback adds snapshot data to the same dir.
+            let audit_state = if !flags.no_audit {
+                let session_id = format!(
+                    "{}-{}",
+                    chrono::Local::now().format("%Y%m%d-%H%M%S"),
+                    std::process::id()
+                );
+
+                let home = dirs::home_dir().ok_or(NonoError::HomeNotFound)?;
+                let session_dir = home.join(".nono").join("rollbacks").join(&session_id);
+                std::fs::create_dir_all(&session_dir).map_err(|e| {
+                    NonoError::Snapshot(format!(
+                        "Failed to create session directory {}: {}",
+                        session_dir.display(),
+                        e
+                    ))
+                })?;
+
+                // Set directory permissions to 0700
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o700);
+                    if let Err(e) = std::fs::set_permissions(&session_dir, perms) {
+                        warn!("Failed to set session directory permissions to 0700: {e}");
+                    }
+                }
+
+                Some((session_id, session_dir))
+            } else {
+                None
+            };
 
             // --- Rollback snapshot lifecycle (only when --rollback is active) ---
             // Warn if rollback-related flags are set but rollback is disabled.
@@ -1055,121 +1127,98 @@ fn execute_sandboxed(
                 }
             }
             let rollback_state = if flags.rollback && !flags.no_rollback {
-                // Collect tracked paths: only USER-specified directories with write access.
-                // System/group paths (caches, frameworks, etc.) are excluded to avoid
-                // snapshotting system directories the user didn't ask to track.
-                let tracked_paths: Vec<std::path::PathBuf> = caps
-                    .fs_capabilities()
-                    .iter()
-                    .filter(|c| {
-                        !c.is_file
-                            && matches!(c.access, AccessMode::Write | AccessMode::ReadWrite)
-                            && matches!(c.source, nono::CapabilitySource::User)
-                    })
-                    .map(|c| c.resolved.clone())
-                    .collect();
-
-                // Enforce storage limits before creating a new session
+                // Enforce storage limits before creating snapshots (audit-only sessions
+                // are tiny and don't count toward these limits)
                 enforce_rollback_limits(flags.silent);
 
-                if !tracked_paths.is_empty() {
-                    let session_id = format!(
-                        "{}-{}",
-                        chrono::Local::now().format("%Y%m%d-%H%M%S"),
-                        std::process::id()
-                    );
+                if let Some((ref _session_id, ref session_dir)) = audit_state {
+                    // Collect tracked paths: only USER-specified directories with write access.
+                    // System/group paths (caches, frameworks, etc.) are excluded to avoid
+                    // snapshotting system directories the user didn't ask to track.
+                    let tracked_paths: Vec<std::path::PathBuf> = caps
+                        .fs_capabilities()
+                        .iter()
+                        .filter(|c| {
+                            !c.is_file
+                                && matches!(c.access, AccessMode::Write | AccessMode::ReadWrite)
+                                && matches!(c.source, nono::CapabilitySource::User)
+                        })
+                        .map(|c| c.resolved.clone())
+                        .collect();
 
-                    let home = dirs::home_dir().ok_or(NonoError::HomeNotFound)?;
-                    let session_dir = home.join(".nono").join("rollbacks").join(&session_id);
-                    std::fs::create_dir_all(&session_dir).map_err(|e| {
-                        NonoError::Snapshot(format!(
-                            "Failed to create session directory {}: {}",
-                            session_dir.display(),
-                            e
-                        ))
-                    })?;
+                    if !tracked_paths.is_empty() {
+                        // When --rollback-all is set, only exclude VCS internals
+                        // (restoring partial .git/ corrupts the repo). Otherwise
+                        // use the full base exclusion list.
+                        let mut patterns = if flags.rollback_all {
+                            rollback_vcs_exclusions()
+                        } else {
+                            rollback_base_exclusions()
+                        };
+                        patterns.extend(flags.rollback_exclude_patterns.iter().cloned());
+                        patterns.sort_unstable();
+                        patterns.dedup();
+                        let base_patterns = patterns.clone();
+                        let exclusion_config = nono::undo::ExclusionConfig {
+                            use_gitignore: true,
+                            exclude_patterns: patterns,
+                            exclude_globs: flags.rollback_exclude_globs.clone(),
+                            force_include: flags.rollback_include.clone(),
+                        };
+                        // Use the first tracked path as gitignore root
+                        let gitignore_root = tracked_paths
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let mut exclusion =
+                            nono::undo::ExclusionFilter::new(exclusion_config, &gitignore_root)?;
 
-                    // Set directory permissions to 0700
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let perms = std::fs::Permissions::from_mode(0o700);
-                        let _ = std::fs::set_permissions(&session_dir, perms);
-                    }
+                        // Run preflight to detect large unexcluded directories.
+                        // When --rollback-all is NOT set, auto-exclude detected heavy dirs
+                        // and print a one-line notice. This ensures zero-flag usage Just Works.
+                        // Directories listed in --rollback-include are kept (not auto-excluded).
+                        if !flags.rollback_all {
+                            let preflight_result =
+                                rollback_preflight::run_preflight(&tracked_paths, &exclusion);
 
-                    // When --rollback-all is set, only exclude VCS internals
-                    // (restoring partial .git/ corrupts the repo). Otherwise
-                    // use the full base exclusion list.
-                    let mut patterns = if flags.rollback_all {
-                        rollback_vcs_exclusions()
-                    } else {
-                        rollback_base_exclusions()
-                    };
-                    patterns.extend(flags.rollback_exclude_patterns.iter().cloned());
-                    patterns.sort_unstable();
-                    patterns.dedup();
-                    let base_patterns = patterns.clone();
-                    let exclusion_config = nono::undo::ExclusionConfig {
-                        use_gitignore: true,
-                        exclude_patterns: patterns,
-                        exclude_globs: flags.rollback_exclude_globs.clone(),
-                        force_include: flags.rollback_include.clone(),
-                    };
-                    // Use the first tracked path as gitignore root
-                    let gitignore_root = tracked_paths
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let mut exclusion =
-                        nono::undo::ExclusionFilter::new(exclusion_config, &gitignore_root)?;
+                            if preflight_result.needs_warning() {
+                                // Filter out any dirs the user explicitly wants to include
+                                let auto_excluded: Vec<&rollback_preflight::HeavyDir> =
+                                    preflight_result
+                                        .heavy_dirs
+                                        .iter()
+                                        .filter(|d| !flags.rollback_include.contains(&d.name))
+                                        .collect();
 
-                    // Run preflight to detect large unexcluded directories.
-                    // When --rollback-all is NOT set, auto-exclude detected heavy dirs
-                    // and print a one-line notice. This ensures zero-flag usage Just Works.
-                    // Directories listed in --rollback-include are kept (not auto-excluded).
-                    if !flags.rollback_all {
-                        let preflight_result =
-                            rollback_preflight::run_preflight(&tracked_paths, &exclusion);
+                                if !auto_excluded.is_empty() {
+                                    let excluded_names: Vec<String> =
+                                        auto_excluded.iter().map(|d| d.name.clone()).collect();
+                                    let mut all_patterns = base_patterns.clone();
+                                    all_patterns.extend(excluded_names);
+                                    all_patterns.sort_unstable();
+                                    all_patterns.dedup();
+                                    let updated_config = nono::undo::ExclusionConfig {
+                                        use_gitignore: true,
+                                        exclude_patterns: all_patterns,
+                                        exclude_globs: flags.rollback_exclude_globs.clone(),
+                                        force_include: flags.rollback_include.clone(),
+                                    };
+                                    exclusion = nono::undo::ExclusionFilter::new(
+                                        updated_config,
+                                        &gitignore_root,
+                                    )?;
 
-                        if preflight_result.needs_warning() {
-                            // Filter out any dirs the user explicitly wants to include
-                            let auto_excluded: Vec<&rollback_preflight::HeavyDir> =
-                                preflight_result
-                                    .heavy_dirs
-                                    .iter()
-                                    .filter(|d| !flags.rollback_include.contains(&d.name))
-                                    .collect();
-
-                            if !auto_excluded.is_empty() {
-                                let excluded_names: Vec<String> =
-                                    auto_excluded.iter().map(|d| d.name.clone()).collect();
-                                let mut all_patterns = base_patterns.clone();
-                                all_patterns.extend(excluded_names);
-                                all_patterns.sort_unstable();
-                                all_patterns.dedup();
-                                let updated_config = nono::undo::ExclusionConfig {
-                                    use_gitignore: true,
-                                    exclude_patterns: all_patterns,
-                                    exclude_globs: flags.rollback_exclude_globs.clone(),
-                                    force_include: flags.rollback_include.clone(),
-                                };
-                                exclusion = nono::undo::ExclusionFilter::new(
-                                    updated_config,
-                                    &gitignore_root,
-                                )?;
-
-                                // Print notice showing only actually-excluded dirs
-                                if !flags.silent {
-                                    rollback_preflight::print_auto_exclude_notice(
-                                        &auto_excluded,
-                                        &preflight_result,
-                                    );
+                                    // Print notice showing only actually-excluded dirs
+                                    if !flags.silent {
+                                        rollback_preflight::print_auto_exclude_notice(
+                                            &auto_excluded,
+                                            &preflight_result,
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    {
                         let mut manager = nono::undo::SnapshotManager::new(
                             session_dir.clone(),
                             tracked_paths.clone(),
@@ -1182,39 +1231,31 @@ fn execute_sandboxed(
 
                         output::print_rollback_tracking(&tracked_paths, flags.silent);
 
-                        Some((
-                            manager,
-                            baseline,
-                            session_id,
-                            session_dir,
-                            tracked_paths,
-                            atomic_temp_before,
-                        ))
+                        Some((manager, baseline, tracked_paths, atomic_temp_before))
+                    } else {
+                        None
                     }
                 } else {
+                    // audit_state is None (--no-audit). Clap prevents --rollback + --no-audit,
+                    // so this branch is unreachable in normal CLI usage.
                     None
                 }
             } else {
                 None
             };
 
-            // --- Supervisor IPC setup (only when --supervised is active) ---
-            let supervisor_cfg_data = if flags.supervised {
-                let policy_data = policy::load_embedded_policy()?;
-                let mut never_grant = policy_data.never_grant;
-                let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
-                never_grant.extend(protected_roots.as_strings()?);
-                never_grant.sort();
-                never_grant.dedup();
-                let never_grant_checker = nono::NeverGrantChecker::new(&never_grant)?;
-                let approval_backend = terminal_approval::TerminalApproval;
-                Some((never_grant_checker, approval_backend))
-            } else {
-                None
-            };
-            let supervisor_session_id = rollback_state
+            // --- Supervisor IPC setup (always active in Supervised mode) ---
+            let policy_data = policy::load_embedded_policy()?;
+            let mut never_grant = policy_data.never_grant;
+            let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
+            never_grant.extend(protected_roots.as_strings()?);
+            never_grant.sort();
+            never_grant.dedup();
+            let never_grant_checker = nono::NeverGrantChecker::new(&never_grant)?;
+            let approval_backend = terminal_approval::TerminalApproval;
+            let supervisor_session_id = audit_state
                 .as_ref()
-                .map(|(_, _, session_id, _, _, _)| session_id.clone())
+                .map(|(session_id, _)| session_id.clone())
                 .unwrap_or_else(|| {
                     format!(
                         "supervised-{}-{}",
@@ -1222,13 +1263,11 @@ fn execute_sandboxed(
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
                     )
                 });
-            let supervisor_cfg = supervisor_cfg_data.as_ref().map(|(checker, backend)| {
-                exec_strategy::SupervisorConfig {
-                    never_grant: checker,
-                    approval_backend: backend,
-                    session_id: &supervisor_session_id,
-                }
-            });
+            let supervisor_cfg = exec_strategy::SupervisorConfig {
+                never_grant: &never_grant_checker,
+                approval_backend: &approval_backend,
+                session_id: &supervisor_session_id,
+            };
 
             let trust_interceptor = if !flags.trust_override {
                 match trust_scan::load_scan_policy(&flags.scan_root, false) {
@@ -1269,43 +1308,41 @@ fn execute_sandboxed(
             let started = chrono::Local::now().to_rfc3339();
             let exit_code = exec_strategy::execute_supervised(
                 &config,
-                supervisor_cfg.as_ref(),
+                Some(&supervisor_cfg),
                 trust_interceptor,
             )?;
             let ended = chrono::Local::now().to_rfc3339();
 
-            // Post-exit: take final snapshot and offer restore
-            if let Some((
-                mut manager,
-                baseline,
-                session_id,
-                _session_dir,
-                tracked_paths,
-                atomic_temp_before,
-            )) = rollback_state
+            // --- Post-exit: rollback snapshots + audit metadata ---
+            let mut network_events = proxy_handle.as_ref().map_or_else(
+                Vec::new,
+                nono_proxy::server::ProxyHandle::drain_audit_events,
+            );
+
+            let mut audit_saved = false;
+
+            if let Some((mut manager, baseline, tracked_paths, atomic_temp_before)) = rollback_state
             {
                 let (final_manifest, changes) = manager.create_incremental(&baseline)?;
-
-                // Collect merkle roots
                 let merkle_roots = vec![baseline.merkle_root, final_manifest.merkle_root];
 
-                // Save session metadata
-                let network_events = proxy_handle.as_ref().map_or_else(
-                    Vec::new,
-                    nono_proxy::server::ProxyHandle::drain_audit_events,
-                );
+                // Save session metadata (via SnapshotManager which owns the session dir)
                 let meta = nono::undo::SessionMetadata {
-                    session_id,
-                    started,
-                    ended: Some(ended),
+                    session_id: audit_state
+                        .as_ref()
+                        .map(|(id, _)| id.clone())
+                        .unwrap_or_default(),
+                    started: started.clone(),
+                    ended: Some(ended.clone()),
                     command: command.clone(),
                     tracked_paths,
                     snapshot_count: manager.snapshot_count(),
                     exit_code: Some(exit_code),
                     merkle_roots,
-                    network_events,
+                    network_events: std::mem::take(&mut network_events),
                 };
                 manager.save_session_metadata(&meta)?;
+                audit_saved = true;
 
                 // Show summary and offer restore
                 if !changes.is_empty() {
@@ -1317,6 +1354,24 @@ fn execute_sandboxed(
                 }
 
                 let _ = manager.cleanup_new_atomic_temp_files(&atomic_temp_before);
+            }
+
+            // Audit-only: write session.json when rollback didn't handle it
+            if !audit_saved {
+                if let Some((ref session_id, ref session_dir)) = audit_state {
+                    let meta = nono::undo::SessionMetadata {
+                        session_id: session_id.clone(),
+                        started,
+                        ended: Some(ended),
+                        command: command.clone(),
+                        tracked_paths: Vec::new(),
+                        snapshot_count: 0,
+                        exit_code: Some(exit_code),
+                        merkle_roots: Vec::new(),
+                        network_events,
+                    };
+                    nono::undo::SnapshotManager::write_session_metadata(session_dir, &meta)?;
+                }
             }
 
             cleanup_capability_state_file(&cap_file_path);
@@ -1369,8 +1424,6 @@ pub(crate) fn rollback_base_exclusions() -> Vec<String> {
 struct PreparedSandbox {
     caps: CapabilitySet,
     secrets: Vec<nono::LoadedSecret>,
-    /// Whether the profile indicates interactive mode (needs TTY)
-    interactive: bool,
     /// Profile-specific rollback exclusion patterns (additive on base patterns)
     rollback_exclude_patterns: Vec<String>,
     /// Profile-specific rollback exclusion globs (filename matching)
@@ -1460,10 +1513,6 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
 
     // Extract config before profile is consumed for secrets
     let profile_workdir_access = loaded_profile.as_ref().map(|p| p.workdir.access.clone());
-    let profile_interactive = loaded_profile
-        .as_ref()
-        .map(|p| p.interactive)
-        .unwrap_or(false);
     let profile_rollback_patterns = loaded_profile
         .as_ref()
         .map(|p| p.rollback.exclude_patterns.clone())
@@ -1665,7 +1714,6 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
     Ok(PreparedSandbox {
         caps,
         secrets: loaded_secrets,
-        interactive: profile_interactive,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
         network_profile: profile_network_profile,
@@ -1928,7 +1976,6 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
-            interactive: false,
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: Some("developer".to_string()),
@@ -1960,7 +2007,6 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
-            interactive: false,
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: Some("developer".to_string()),
