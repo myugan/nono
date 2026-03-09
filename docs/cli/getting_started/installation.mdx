@@ -21,7 +21,7 @@ brew install nono
 Download the `.deb` package from [GitHub Releases](https://github.com/always-further/nono/releases):
 
 ```bash
-VERSION=0.14.0
+VERSION=$(curl -sI https://github.com/always-further/nono/releases/latest | grep -i location | grep -oP 'v\K[0-9.]+')
 wget https://github.com/always-further/nono/releases/download/v${VERSION}/nono-cli_${VERSION}-1_amd64.deb
 sudo dpkg -i nono-cli_${VERSION}-1_amd64.deb
 ```
