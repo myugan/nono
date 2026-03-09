@@ -13,7 +13,7 @@ keywords = ["sandbox", "security", "cli", "landlock", "seatbelt"]
 categories = ["command-line-utilities", "development-tools"]
 
 [package.metadata.deb]
-maintainer = "Luke Hinds <luke@nono.sh>"
+maintainer = "Luke Hinds"
 copyright = "2025-2026, Luke Hinds"
 depends = "$auto, libc6 (>= 2.34)"
 recommends = "1password-cli | gnome-keyring"
